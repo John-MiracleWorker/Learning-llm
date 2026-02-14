@@ -5,8 +5,10 @@ Provides the "Wake Phase" memory layer:
   • Store new facts taught by the user
   • Semantic retrieval (RAG) for injecting context into prompts
   • Admin operations: list, delete, mark-as-learned, wipe
+  • LLM-as-a-Judge contradiction detection for fact supersession
 """
 
+import re
 import time
 import uuid
 from typing import Optional
@@ -42,24 +44,133 @@ def get_collection() -> chromadb.Collection:
     )
 
 
+# ── LLM-as-a-Judge Contradiction Detection (Bug 2B) ──────────────────────
+
+
+def _llm_contradiction_check(new_fact: str, old_fact: str) -> bool:
+    """
+    Use the LLM to determine if a new fact logically contradicts an old fact.
+
+    Dense embeddings measure semantic TOPICS, not logical DIRECTION.
+    "I love Python" and "I hate Python" are nearly identical in embedding space.
+    This two-stage verification uses the LLM as a judge to detect actual
+    contradictions vs. merely related facts.
+
+    Args:
+        new_fact: The newly stated fact.
+        old_fact: The existing fact to check against.
+
+    Returns:
+        True if the LLM judges them as contradictory (old should be superseded).
+    """
+    from mlx_lm import generate, load
+    from mlx_lm.sample_utils import make_sampler
+
+    adapter_file = __import__("os").path.join(config.ADAPTER_DIR, "adapters.safetensors")
+    if __import__("os").path.exists(adapter_file):
+        model, tokenizer = load(
+            config.BASE_MODEL,
+            adapter_path=config.ADAPTER_DIR,
+            tokenizer_config={"trust_remote_code": True},
+        )
+    else:
+        model, tokenizer = load(
+            config.BASE_MODEL,
+            tokenizer_config={"trust_remote_code": True},
+        )
+
+    messages = [
+        {"role": "system", "content": (
+            "You are a factual contradiction detector. "
+            "Determine whether a NEW fact logically contradicts or updates an OLD fact. "
+            "Related but non-contradictory facts should NOT be flagged. "
+            "Answer ONLY 'YES' or 'NO'."
+        )},
+        {"role": "user", "content": (
+            f'OLD FACT: "{old_fact}"\n'
+            f'NEW FACT: "{new_fact}"\n\n'
+            "Does the NEW FACT contradict or update the OLD FACT? (YES/NO)"
+        )},
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    raw = generate(
+        model, tokenizer, prompt=prompt,
+        max_tokens=32, sampler=make_sampler(temp=0.1),
+    )
+    # Strip thinking blocks
+    raw = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
+
+    del model, tokenizer
+    import gc
+    gc.collect()
+
+    return "YES" in raw.upper()
+
+
 # ── Write Operations ──────────────────────────────────────────────────────
 
 
-def store_fact(fact_text: str, source: str = "user") -> str:
+def store_fact(fact_text: str, source: str = "user") -> tuple[str, list[dict]]:
     """
-    Store a single fact in short-term memory.
+    Store a single fact in short-term memory with LLM-verified conflict detection.
+
+    Two-stage RAG Verification (Bug 2B):
+      Stage 1: ChromaDB retrieves candidates within SUPERSEDE_DISTANCE_THRESHOLD
+      Stage 2: LLM judges whether each candidate is actually contradicted
+
+    This prevents false supersession of related-but-distinct facts
+    (e.g., "I love Python" vs "I love JavaScript" would NOT be superseded).
 
     Args:
         fact_text: The raw fact string to remember.
-        source:    Origin tag — "user" for manually taught, "correction" for
-                   corrections, etc.
+        source:    Origin tag — "user" for manually taught, "auto" for
+                   auto-detected, "correction" for corrections.
 
     Returns:
-        The unique ID assigned to this fact.
+        Tuple of (fact_id, list of superseded fact dicts).
     """
     collection = get_collection()
     fact_id = f"fact-{uuid.uuid4().hex[:12]}"
     timestamp = time.time()
+
+    # Conflict detection: two-stage (embedding similarity + LLM judge)
+    superseded = []
+    if collection.count() > 0:
+        effective_k = min(3, collection.count())
+        results = collection.query(
+            query_texts=[fact_text],
+            n_results=effective_k,
+        )
+        for i in range(len(results["ids"][0])):
+            distance = results["distances"][0][i]
+            # Stage 1: Wider net for candidate retrieval (was 0.15, now 0.3)
+            if distance < config.SUPERSEDE_DISTANCE_THRESHOLD:
+                old_id = results["ids"][0][i]
+                old_text = results["documents"][0][i]
+                old_meta = results["metadatas"][0][i]
+
+                # Skip already-superseded facts
+                if old_meta.get("superseded") == "true":
+                    continue
+
+                # Stage 2: LLM-as-a-Judge — does it truly contradict?
+                if _llm_contradiction_check(fact_text, old_text):
+                    # Mark old fact as superseded
+                    collection.update(
+                        ids=[old_id],
+                        metadatas=[{
+                            **old_meta,
+                            "superseded_by": fact_id,
+                            "superseded": "true",
+                        }],
+                    )
+                    superseded.append({
+                        "id": old_id,
+                        "text": old_text,
+                        "metadata": old_meta,
+                    })
 
     collection.add(
         ids=[fact_id],
@@ -70,7 +181,7 @@ def store_fact(fact_text: str, source: str = "user") -> str:
             "learned": "false",  # flipped to "true" after Sleep cycle
         }],
     )
-    return fact_id
+    return fact_id, superseded
 
 
 # ── Read Operations ───────────────────────────────────────────────────────
@@ -83,6 +194,9 @@ def retrieve(query: str, top_k: int = config.RAG_TOP_K) -> list[dict]:
     Returns a list of dicts with keys: id, text, distance, metadata.
     Results are filtered by RAG_RELEVANCE_THRESHOLD (cosine distance;
     lower distance = higher similarity).
+
+    Bug 1C fix: Superseded facts are excluded from query results
+    to prevent contradictory information from being injected into RAG context.
     """
     collection = get_collection()
 
@@ -92,9 +206,12 @@ def retrieve(query: str, top_k: int = config.RAG_TOP_K) -> list[dict]:
     # Clamp top_k to available documents
     effective_k = min(top_k, collection.count())
 
+    # Bug 1C: Filter out superseded facts so stale/contradictory data
+    # never pollutes the RAG context sent to the LLM
     results = collection.query(
         query_texts=[query],
         n_results=effective_k,
+        where={"superseded": {"$ne": "true"}},
     )
 
     hits = []

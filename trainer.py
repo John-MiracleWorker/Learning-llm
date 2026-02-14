@@ -10,9 +10,12 @@ Handles the Sleep Phase:
 """
 
 import gc
+import glob
 import json
 import math
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -245,6 +248,10 @@ def post_training_cleanup(fact_ids: list[str]) -> dict:
       1. Mark all processed facts as learned in ChromaDB
       2. Clean up temporary training files
 
+    Note: Replay buffer append was moved to curator.py (Bug 1B fix).
+    New samples are appended there BEFORE mixing to prevent the old
+    duplication explosion where mixed data was re-appended every cycle.
+
     Args:
         fact_ids: IDs of facts that were baked into the adapter.
 
@@ -300,22 +307,175 @@ def verify_adapter() -> dict:
     return info
 
 
+# ── Adapter Versioning ─────────────────────────────────────────────────────
+
+MAX_ADAPTER_VERSIONS = 3
+
+
+def version_adapter() -> Optional[str]:
+    """
+    Back up the current adapter before training overwrites it.
+    Keeps the last MAX_ADAPTER_VERSIONS versions.
+
+    Returns:
+        Path to the backup, or None if no adapter exists.
+    """
+    adapter_file = os.path.join(config.ADAPTER_DIR, "adapters.safetensors")
+    if not os.path.exists(adapter_file):
+        return None
+
+    # Find next version number
+    existing = sorted(glob.glob(os.path.join(config.ADAPTER_DIR, "v[0-9]*")))
+    if existing:
+        last_num = max(
+            int(os.path.basename(p).lstrip("v"))
+            for p in existing
+            if os.path.basename(p).lstrip("v").isdigit()
+        )
+        next_num = last_num + 1
+    else:
+        next_num = 1
+
+    # Copy current adapter to versioned directory
+    version_dir = os.path.join(config.ADAPTER_DIR, f"v{next_num}")
+    os.makedirs(version_dir, exist_ok=True)
+    for fname in os.listdir(config.ADAPTER_DIR):
+        fpath = os.path.join(config.ADAPTER_DIR, fname)
+        if os.path.isfile(fpath):
+            shutil.copy2(fpath, os.path.join(version_dir, fname))
+
+    # Prune old versions (keep last N)
+    existing = sorted(glob.glob(os.path.join(config.ADAPTER_DIR, "v[0-9]*")))
+    while len(existing) > MAX_ADAPTER_VERSIONS:
+        shutil.rmtree(existing.pop(0))
+
+    return version_dir
+
+
+# ── Post-Sleep Verification ───────────────────────────────────────────────
+
+
+def verify_fact_recall(
+    facts: list[dict],
+    log_callback: Optional[callable] = None,
+) -> dict:
+    """
+    Quiz the model on trained facts WITHOUT RAG to measure bake-in accuracy.
+
+    For each fact, asks a simple question and checks if the answer
+    contains key terms from the fact.
+
+    Args:
+        facts:        List of fact dicts with 'text' key.
+        log_callback: Optional fn(line) for logging.
+
+    Returns:
+        Dict with recall_rate (0-1), passed, failed, and details.
+    """
+    from mlx_lm import generate, load
+    from mlx_lm.sample_utils import make_sampler
+
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    _log("[verify] Loading model for fact recall verification...")
+
+    adapter_path = config.ADAPTER_DIR
+    adapter_file = os.path.join(adapter_path, "adapters.safetensors")
+
+    if os.path.exists(adapter_file):
+        model, tokenizer = load(
+            config.BASE_MODEL,
+            adapter_path=adapter_path,
+            tokenizer_config={"trust_remote_code": True},
+        )
+    else:
+        model, tokenizer = load(
+            config.BASE_MODEL,
+            tokenizer_config={"trust_remote_code": True},
+        )
+
+    passed = 0
+    failed = 0
+    details = []
+
+    for fact in facts:
+        fact_text = fact["text"]
+        # Generate a quiz question about the fact
+        quiz_prompt = (
+            f"Based on what you know, answer this: "
+            f"What do you know about: {fact_text.split()[0:5]}?"
+        )
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Answer concisely."},
+            {"role": "user", "content": f"Tell me: {fact_text}"},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        response = generate(
+            model, tokenizer, prompt=prompt,
+            max_tokens=256, sampler=make_sampler(temp=0.1),
+        )
+        # Strip thinking blocks
+        response = re.sub(r"<think>.*?</think>\s*", "", response, flags=re.DOTALL).strip()
+
+        # Check if key terms from the fact appear in the response
+        fact_words = set(w.lower() for w in fact_text.split() if len(w) > 3)
+        response_lower = response.lower()
+        matched = sum(1 for w in fact_words if w in response_lower)
+        recall = matched / max(len(fact_words), 1)
+
+        if recall >= 0.3:
+            passed += 1
+            status = "PASS"
+        else:
+            failed += 1
+            status = "FAIL"
+
+        details.append({
+            "fact": fact_text[:80],
+            "status": status,
+            "recall": round(recall, 2),
+        })
+        _log(f"[verify] {status} ({recall:.0%}): {fact_text[:60]}...")
+
+    # Free model
+    del model, tokenizer
+    gc.collect()
+
+    total = passed + failed
+    recall_rate = passed / max(total, 1)
+    _log(f"[verify] Recall rate: {passed}/{total} ({recall_rate:.0%})")
+
+    return {
+        "recall_rate": round(recall_rate, 2),
+        "passed": passed,
+        "failed": failed,
+        "details": details,
+    }
+
+
 # ── Full Sleep Pipeline ───────────────────────────────────────────────────
 
 
 def run_sleep_cycle(
     fact_ids: list[str],
+    facts: Optional[list[dict]] = None,
     log_callback: Optional[callable] = None,
 ) -> dict:
     """
     Execute the full Sleep phase:
-      1. Clear inference model from RAM
-      2. Generate LoRA config
-      3. Run MLX training (caffeinate-wrapped)
-      4. On success: mark facts as learned, clean up
+      1. Version current adapter (backup)
+      2. Clear inference model from RAM
+      3. Generate LoRA config
+      4. Run MLX training (caffeinate-wrapped)
+      5. On success: mark facts as learned, clean up, verify recall
 
     Args:
         fact_ids:     Fact IDs to mark as learned on success.
+        facts:        Optional list of fact dicts for post-training verification.
         log_callback: Optional fn(line: str) for streaming log output.
 
     Returns:
@@ -325,11 +485,19 @@ def run_sleep_cycle(
         if log_callback:
             log_callback(msg)
 
-    # 1. Clear inference model
+    # 1. Version current adapter
+    _log("[sleep] Backing up current adapter...")
+    backup_path = version_adapter()
+    if backup_path:
+        _log(f"[sleep] Adapter backed up to: {os.path.basename(backup_path)}")
+    else:
+        _log("[sleep] No existing adapter to back up.")
+
+    # 2. Clear inference model
     _log("[sleep] Clearing inference model from unified memory...")
     clear_inference_model()
 
-    # 2. Generate config
+    # 3. Generate config
     _log("[sleep] Generating LoRA training configuration...")
     config_path = generate_lora_config()
     _log(f"[sleep] Config written to: {config_path}")
@@ -339,7 +507,7 @@ def run_sleep_cycle(
     _log(f"[sleep] Dataset: {n_samples} samples → {iters} iterations")
     _log("")
 
-    # 3. Run training
+    # 4. Run training
     success, log_output = run_training(config_path, log_callback=log_callback)
 
     result = {
@@ -349,17 +517,29 @@ def run_sleep_cycle(
         "log": log_output,
     }
 
-    # 4. Post-training
+    # 5. Post-training
     if success:
         _log("")
         _log("[sleep] Running post-training cleanup...")
         cleanup = post_training_cleanup(fact_ids)
         result["cleanup"] = cleanup
+        _log(f"[sleep] Marked {cleanup['facts_marked_learned']} facts as learned.")
 
         adapter_info = verify_adapter()
         result["adapter"] = adapter_info
         if adapter_info["exists"]:
             _log(f"[sleep] Adapter saved: {adapter_info['size_mb']} MB")
+
+        # 6. Post-sleep verification (self-quiz)
+        if facts:
+            _log("")
+            _log("=" * 60)
+            _log("  PHASE 3: VERIFICATION (Self-Quiz)")
+            _log("=" * 60)
+            _log("")
+            verification = verify_fact_recall(facts, log_callback=log_callback)
+            result["verification"] = verification
+
         _log("[sleep] Sleep cycle complete.")
     else:
         _log("")

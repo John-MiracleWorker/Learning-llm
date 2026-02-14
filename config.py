@@ -16,7 +16,7 @@ TRAIN_JSONL_PATH = os.path.join(DATA_DIR, "train.jsonl")
 VALID_JSONL_PATH = os.path.join(DATA_DIR, "valid.jsonl")
 
 # ── Model ──────────────────────────────────────────────────────────────────
-BASE_MODEL = "mlx-community/Qwen2.5-3B-Instruct-4bit"
+BASE_MODEL = "mlx-community/Qwen3-4B-Thinking-2507-4bit"
 
 # ── LoRA Hyperparameters ───────────────────────────────────────────────────
 LORA_RANK = 16
@@ -40,6 +40,13 @@ GRAD_ACCUMULATION = 4      # effective batch size = BATCH_SIZE * GRAD_ACCUMULATI
 # ── Replay Mixing Ratio ───────────────────────────────────────────────────
 NEW_DATA_RATIO = 0.20      # 20% new facts
 OLD_DATA_RATIO = 0.80      # 80% replay buffer
+MINIMUM_DATASET_SIZE = 200 # Pad dataset to at least this many samples to prevent overfitting
+
+# ── Fact Conflict Detection ────────────────────────────────────────────────
+SUPERSEDE_DISTANCE_THRESHOLD = 0.3  # Cosine distance for LLM-as-Judge candidate retrieval
+
+# ── Memory Compression ────────────────────────────────────────────────────
+MEMORY_COMPRESSION_BATCH_SIZE = 20  # Max facts per compression prompt to avoid context blowout
 
 # ── ChromaDB ───────────────────────────────────────────────────────────────
 CHROMA_COLLECTION_NAME = "short_term_memory"

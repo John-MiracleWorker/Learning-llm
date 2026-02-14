@@ -5,8 +5,11 @@ Bridges the Wake → Sleep transition:
   1. Extract unlearned facts from ChromaDB
   2. Use the Qwen model (via mlx_lm) to synthesize 3–5 diverse Q/A pairs
      per fact in ChatML JSONL format
-  3. Mathematically mix new data with the Replay Buffer at 20/80 ratio
-  4. Write train.jsonl + valid.jsonl for the Sleep phase
+  3. Verify synthesized QA pairs for hallucinations (Bug 2C)
+  4. Append ONLY new samples to Replay Buffer (Bug 1B fix)
+  5. Mathematically mix new data with the Replay Buffer at 20/80 ratio
+  6. Enforce MINIMUM_DATASET_SIZE to prevent overfitting (Bug 2A)
+  7. Write train.jsonl + valid.jsonl for the Sleep phase
 """
 
 import gc
@@ -88,6 +91,62 @@ def _qa_to_chatml(question: str, answer: str) -> dict:
     }
 
 
+# ── Hallucination Verification (Bug 2C) ──────────────────────────────────
+
+
+def _verify_qa_pair(
+    fact: str,
+    question: str,
+    answer: str,
+    model,
+    tokenizer,
+) -> bool:
+    """
+    Verify that a generated Q/A pair does not hallucinate beyond the source fact.
+
+    The 4B model generating its own training data can introduce errors
+    that get permanently baked into the replay buffer, causing Model Collapse.
+
+    Args:
+        fact:      The source fact the QA pair was generated from.
+        question:  The generated question.
+        answer:    The generated answer.
+        model:     Pre-loaded MLX model.
+        tokenizer: Pre-loaded tokenizer.
+
+    Returns:
+        True if the QA pair is faithful to the fact (passes verification).
+    """
+    from mlx_lm import generate
+    from mlx_lm.sample_utils import make_sampler
+
+    messages = [
+        {"role": "system", "content": (
+            "You are a strict fact-checker. Determine whether the ANSWER "
+            "contains information NOT present in or directly inferable from the FACT. "
+            "Answer ONLY 'YES' (contains hallucination) or 'NO' (faithful to fact)."
+        )},
+        {"role": "user", "content": (
+            f'FACT: "{fact}"\n'
+            f'QUESTION: "{question}"\n'
+            f'ANSWER: "{answer}"\n\n'
+            "Does the ANSWER contain hallucinated information not present in the FACT? (YES/NO)"
+        )},
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    raw = generate(
+        model, tokenizer, prompt=prompt,
+        max_tokens=32, sampler=make_sampler(temp=0.1),
+    )
+    # Strip thinking blocks
+    raw = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.DOTALL).strip()
+
+    # "YES" means hallucination detected → pair FAILS verification
+    return "YES" not in raw.upper()
+
+
 # ── Core Pipeline ─────────────────────────────────────────────────────────
 
 
@@ -96,6 +155,7 @@ def generate_qa_pairs(
     n_pairs: int = 4,
     model=None,
     tokenizer=None,
+    verify: bool = True,
 ) -> list[dict]:
     """
     Use the loaded Qwen model to synthesize diverse Q/A pairs for a fact.
@@ -105,6 +165,7 @@ def generate_qa_pairs(
         n_pairs:   Number of Q/A pairs to generate (3–5).
         model:     Pre-loaded MLX model (if None, will load).
         tokenizer: Pre-loaded tokenizer (if None, will load).
+        verify:    If True, run hallucination check on each pair (Bug 2C).
 
     Returns:
         List of ChatML-formatted dicts ready for JSONL.
@@ -128,19 +189,27 @@ def generate_qa_pairs(
         messages, tokenize=False, add_generation_prompt=True,
     )
 
+    from mlx_lm.sample_utils import make_sampler
+
     raw_output = generate(
         model,
         tokenizer,
         prompt=chat_prompt,
         max_tokens=config.MAX_TOKENS,
-        temp=0.7,
+        sampler=make_sampler(temp=0.7),
     )
 
+    # Strip <think>...</think> blocks from Qwen3 thinking model output
+    raw_output = re.sub(r"<think>.*?</think>\s*", "", raw_output, flags=re.DOTALL)
     pairs = _parse_qa_pairs(raw_output)
 
-    # Convert to ChatML format
+    # Convert to ChatML format with optional hallucination verification
     chatml_pairs = []
     for pair in pairs:
+        if verify:
+            # Bug 2C: Verify the QA pair doesn't hallucinate beyond the fact
+            if not _verify_qa_pair(fact, pair["question"], pair["answer"], model, tokenizer):
+                continue  # Discard hallucinated pairs
         chatml_pairs.append(_qa_to_chatml(pair["question"], pair["answer"]))
 
     return chatml_pairs
@@ -182,6 +251,7 @@ def synthesize_all_facts(
             n_pairs=n_pairs,
             model=model,
             tokenizer=tokenizer,
+            verify=True,  # Bug 2C: verify each pair
         )
         all_samples.extend(pairs)
 
@@ -209,6 +279,9 @@ def mix_with_replay(new_samples: list[dict]) -> list[dict]:
 
         If the replay buffer has fewer samples than needed, we oversample
         (repeat) from the buffer to maintain the exact ratio.
+
+    Bug 2A fix: If the mixed total is below MINIMUM_DATASET_SIZE, pad with
+    additional unique replay buffer samples to prevent overfitting.
     """
     if not new_samples:
         return []
@@ -232,6 +305,13 @@ def mix_with_replay(new_samples: list[dict]) -> list[dict]:
     # Calculate required old samples to maintain 20/80 ratio
     # T = N / 0.20, old = T - N = N * (0.80 / 0.20) = N * 4
     n_old_needed = math.ceil(n_new * (config.OLD_DATA_RATIO / config.NEW_DATA_RATIO))
+
+    # Bug 2A: Enforce minimum dataset size to prevent extreme overfitting
+    # If the 20/80 math yields fewer than MINIMUM_DATASET_SIZE total samples,
+    # pad exclusively with unique replay buffer data to anchor LoRA weights.
+    total_before_padding = n_new + n_old_needed
+    if total_before_padding < config.MINIMUM_DATASET_SIZE:
+        n_old_needed = config.MINIMUM_DATASET_SIZE - n_new
 
     # Oversample from replay buffer if needed
     old_samples = []
@@ -298,9 +378,10 @@ def run_sanitize_pipeline(
     """
     Execute the full Sanitize phase:
       1. Pull unlearned facts from ChromaDB
-      2. Synthesize Q/A pairs
-      3. Mix with replay buffer (20/80)
-      4. Write train.jsonl + valid.jsonl
+      2. Synthesize Q/A pairs (with hallucination verification)
+      3. Append ONLY new samples to replay buffer (Bug 1B fix)
+      4. Mix with replay buffer (20/80) with minimum dataset enforcement
+      5. Write train.jsonl + valid.jsonl
 
     Args:
         n_pairs:           Q/A pairs to generate per fact.
@@ -323,15 +404,26 @@ def run_sanitize_pipeline(
             "fact_ids": [],
         }
 
-    # 2. Synthesize
+    # 2. Synthesize (with hallucination verification — Bug 2C)
     new_samples = synthesize_all_facts(
         facts, n_pairs=n_pairs, progress_callback=progress_callback,
     )
 
-    # 3. Mix with replay buffer
+    # 3. Bug 1B fix: Append ONLY the newly synthesized samples to the
+    #    replay buffer BEFORE mixing. This ensures each new QA pair enters
+    #    the buffer exactly once. Previously, the entire mixed dataset
+    #    (including the 80% old data) was re-appended in trainer.py,
+    #    causing exponential duplication.
+    if new_samples:
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        with open(config.REPLAY_BUFFER_PATH, "a") as f:
+            for sample in new_samples:
+                f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+    # 4. Mix with replay buffer (with minimum dataset enforcement — Bug 2A)
     mixed = mix_with_replay(new_samples)
 
-    # 4. Write to disk
+    # 5. Write to disk
     train_count, valid_count = write_training_data(mixed)
 
     # Collect fact IDs for marking as learned after training
@@ -344,4 +436,5 @@ def run_sanitize_pipeline(
         "train_count": train_count,
         "valid_count": valid_count,
         "fact_ids": fact_ids,
+        "facts": facts,
     }
