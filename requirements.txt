@@ -1,0 +1,15 @@
+# Continual Learning LLM on Apple Silicon (M4)
+# Framework: MLX (Apple-native) — NO PyTorch/CUDA
+
+# MLX ecosystem
+mlx>=0.22.0
+mlx-lm>=0.21.0
+
+# Vector database (local, no Docker)
+chromadb>=0.5.0
+
+# UI
+streamlit>=1.38.0
+
+# Utilities
+numpy>=1.26.0
